@@ -1,6 +1,9 @@
 /*
  * random.c -- A strong random number generator
  *
+ * Copyright (C) 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All
+ * Rights Reserved.
+ *
  * Copyright Matt Mackall <mpm@selenic.com>, 2003, 2004, 2005
  *
  * Copyright Theodore Ts'o, 1994, 1995, 1996, 1997, 1998, 1999.  All
@@ -256,16 +259,16 @@
 #include <linux/cryptohash.h>
 #include <linux/fips.h>
 #include <linux/ptrace.h>
-#include <linux/kmemcheck.h>
 #include <linux/workqueue.h>
 #include <linux/irq.h>
+#include <linux/ratelimit.h>
 #include <linux/syscalls.h>
 #include <linux/completion.h>
 #include <linux/uuid.h>
 #include <crypto/chacha20.h>
 
 #include <asm/processor.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <asm/irq.h>
 #include <asm/irq_regs.h>
 #include <asm/io.h>
@@ -285,7 +288,6 @@
 #define SEC_XFER_SIZE		512
 #define EXTRACT_SIZE		10
 
-#define DEBUG_RANDOM_BOOT 0
 
 #define LONGS(x) (((x) + sizeof(unsigned long) - 1)/sizeof(unsigned long))
 
@@ -305,20 +307,6 @@
  */
 static int random_read_wakeup_bits = 256; //EDIT: 64;
 
-/*
- * If the entropy count falls under this number of bits, then we
- * should wake up processes which are selecting or polling on write
- * access to /dev/random.
- */
-static int random_write_wakeup_bits = 28 * OUTPUT_POOL_WORDS;
-
-/*
- * The minimum number of seconds between urandom pool reseeding.  We
- * do this to limit the amount of entropy that can be drained from the
- * input pool even if there are heavy demands on /dev/urandom.
- */
-static int random_min_urandom_seed = 60;
-
 
 //EDIT:
 
@@ -328,6 +316,16 @@ static const int myrandomness_A[] = {0x507DB012, 0x1F8FCB59, 0x76F07B6, 0x68C24E
 static const int myrandomness_B[] = {0x5ED09BCE, 0xC058C2EF, 0xBFC563D6, 0x792C3772, 0x1CBF1960, 0x60956FC0, 0xB077DF3, 0x39F05306, 0xFAB76137, 0xA9F4BFCE, 0xEC0D48E3, 0xD967026C, 0x1C12C088, 0x391F9A94, 0xAAA1C88C, 0xC16EEC75, 0xF084FBA2, 0x67B96917, 0x106BD77D, 0x23DF6D16, 0x48BB6094, 0x1784416D, 0xA02702B2, 0x81678054, 0x84CF56D4, 0x55DB1855, 0xB183C632, 0x4B46D6B8, 0x75E01325, 0x9BDDEBA, 0xF4084C53, 0xAEBF75AB, 0xA0FB0B0E, 0x3E1D677D, 0xC65DE5B5, 0x36B30DAD, 0x52AC3966, 0xFD669873, 0xD973DAA9, 0x78EF2163, 0xE789724C, 0x3997E1BD, 0x6D3DF8D7, 0xCE5217FE, 0xE3E6D213, 0x748088D5, 0x13156F7, 0xA62677C0, 0x455EA1C2, 0x8B4F6968, 0x2D02D7A2, 0x4FE82E48, 0x2D87A5EB, 0x684667A6, 0x17C85786, 0x3548A833, 0x5C07796D, 0x77B1CEFD, 0xEB1914F9, 0xB3DDF313, 0xD5F393AB, 0xC4745B54, 0x1FCAD79, 0x1355F237, 0x1E9B700C, 0xD6858795, 0x3B06D543, 0xDE8C22C, 0x8773E559, 0x4FAB4571, 0x4EAF954A, 0xCED5B779, 0x55C0A32B, 0x75CFC445, 0xEBE16188, 0xD39A6369, 0xC59C504A, 0xEB6B3C00, 0x7C6AC15F, 0x85338413, 0xD46B2FD9, 0x40BA0154, 0x12976498, 0x54E05330, 0xA9DB48B3, 0xFAB03812, 0xEB098654, 0x4B597D22, 0xA74FF9CA, 0x1E7DBFD, 0xC0E99E77, 0xBD00A20A, 0xFD87E5E6, 0x15B53B47, 0xF9E1D0B3, 0x1307EC65, 0x81F777E3, 0xDB30B228, 0xD9C46A69, 0xA26ABD4B, 0x2A1E51E6, 0x26B5F719, 0x174F2E22, 0x92C4E63D, 0x254ED7AA, 0x53A10ADB, 0x26F75277, 0xC792EE35, 0xD03DE474, 0x297EBE85, 0xA9868A42, 0xC5B7D3D8, 0x42036C35, 0xF57EF054, 0x5AC3B4EE, 0xA4FB396, 0x9765DD39, 0xC15D34, 0x3647C035, 0xFE3E325E, 0x3801434, 0xAC6CF808, 0x9FA43C63, 0x5C80E9D3, 0xD8EB9D3F, 0x1DB5F54B, 0x7BA1ACB4, 0x6FC78A82, 0xAFCE331A, 0x89368504, 0xC00F65C6, 0x4BBD7B58, 0x62E7D766, 0x869CCD7D, 0xD8F7F8BA, 0x63C57382, 0x93466D8A, 0xE5CCB372, 0xF2F57254, 0xDB54889C, 0x4BAC6F9E, 0x6F606042, 0x3AAE16B1, 0xA17BDEF7, 0x1F504235, 0x6C6990FF, 0xAA3CD51F, 0x3237589A, 0xF89056C5, 0xFE0BEAD1, 0x59EFE1CC, 0xBC76C033, 0xA1DAA47E, 0x35434ADA, 0x9E858E11, 0x3C5280BE, 0x9B85B7F1, 0x315182DD, 0x78144F2B, 0xCD6E3C05, 0x26371BB, 0x22F43C5D, 0xD9C005C, 0x69747D, 0xBD95E023, 0xBF1DA56A, 0x94F513EB, 0x2181E155, 0x51BA9A39, 0xD0142CA4, 0x9CC5942, 0xC8CD2D95, 0x4220155E, 0x19C26CB4, 0xEE9F9944, 0xB058A80E, 0xBF2F1774, 0x35F74A7B, 0xF9BF8AC0, 0x9175CE92, 0x180AF233, 0x9592D3A9, 0xC88162B7, 0xDFB104E6, 0x1DE53107, 0x3DDB69F5, 0x7AD798, 0xAEB0515A, 0x3C5FF81D, 0x73343C3C, 0xA99D4F4D, 0x73BB5E52, 0x560E5844, 0x72057CC7, 0x4F993482, 0x65121FFA, 0x7980986E, 0xA0744038, 0xC85E9F26, 0x52B114F4, 0xDC952DE3, 0xDF22068D, 0x9CCB645E, 0x6D4A852B, 0xBF9DF43F, 0xCD05E5EC, 0xEB0BAC86, 0x81D491B8, 0xD2D25A24, 0x7B4A8E3, 0x15D947A4, 0x417DA7EB, 0xE8CC516E, 0xCEA63BF8, 0x79CB4A44, 0x3C455CBC, 0x5E9F821D, 0x2B0EEBC0, 0xCF38C691, 0x2D4DA03B, 0x5970C3E0, 0x94A76BB5, 0x7A33532, 0xB06236C5, 0xFBA4F2CD, 0xDC8AF564, 0xC8A5EB1, 0xAC9509FC, 0xF8CCE70B, 0x15B38FE8, 0x61E555E, 0x9E717596, 0x3802C9DF, 0x71F0F574, 0x30378B7D, 0x527CB53E, 0x1C80108F, 0x38FF9F93, 0x6D2F03A4, 0x6C83E39D, 0x3B8CA0B1, 0xD336B96C, 0xA0F81C27, 0x8B18C474, 0x643B29D, 0x321A04FB, 0xD6D19A06, 0x5BCA6A0C, 0xFE9AA60C, 0x2242ABF3, 0x6810F9A, 0xDBF645BA, 0xAB4EA421, 0x638BCAF0, 0x660C119B, 0xCAF38A74, 0x5F78C0D8, 0x89F59E0C, 0x99D87C43, 0x793CB0F7, 0x44BB452F, 0x5C269412, 0x851A8BF4, 0x3A27F476, 0xD425A62D, 0x647A07C4, 0xBCD4A43C, 0xF59AE7AA, 0x91706ED9, 0xC98B9052, 0x52581557, 0x726593C3, 0x47709046, 0xFD2DBBEB, 0x474AAFCA, 0x88E80434, 0x902A98B9, 0x19D65310, 0x9B4AE779, 0x41961C80, 0xD52E5522, 0x1C3DCFBF, 0xCD399F87, 0xFE8DC343, 0x6742A195, 0x4BD3BABB, 0x8EBC55C7, 0x74DA448D, 0x6A8F304E, 0xE6DF9F55, 0x3C1769C6, 0x32C564E1, 0xC4AD9EC3, 0x9E7D4081, 0x2165CB46, 0x14020E27, 0x574B8A2C, 0x4C77B209, 0xF2861D8, 0x91CCA89F, 0x6B5F2B47, 0x81DEE1A9, 0x7ECD5302, 0xA70037D4, 0x24D04815, 0xA26F899F, 0xE0A982E4, 0x7B0225B9, 0x856103BD, 0xA37E4C59, 0x371E28DE, 0xFD199210, 0xD86D735C, 0x6A4BB8A0, 0xBF3C7865, 0x215EDA87, 0x248197E5, 0x4AAA9070, 0xC56A1540, 0x20C4E642, 0x922DCA04, 0xE2CAC179, 0x3CEEE19C, 0xA7F2E857, 0xA6B0E874, 0xA6042D4C, 0xCAA0BB0C, 0x84E09A83, 0xD0967394, 0xB98BE741, 0xB68744B2, 0x95FA9C27, 0x2D8277AE, 0xA6D57336, 0xB82C4E22, 0xC6B608, 0x1875EFAF, 0xA5757BAB, 0xC69BA3F2, 0xA5A27376, 0xCDCF79CE, 0xAB7B66C7, 0x65578DAF, 0x4D6D404D, 0x375F1A9D, 0xBD95D445, 0xC8E2DB09, 0xD595043E, 0xDC3D02FE, 0x2E928093, 0xF268EC3E, 0xDC9A0E48, 0x66D58387, 0xBF2386AE, 0xB53C0A07, 0xC1546070, 0xC7066285, 0x3AB658E5, 0x2A9739FE, 0x231E82C8, 0x7706F158, 0x400E5062, 0x8FA866CD, 0x9AD9F2A, 0x72085D5E, 0xB5F7F31F, 0xB663992B, 0x7B36D511, 0xF0D96F1D, 0xF2058DB4, 0x35DA8E03, 0x1D5AB8D6, 0xFD5732D2, 0xB176B798, 0x6D28E26E, 0x1A1FD567, 0x982FBFBB, 0xFDD37FBF, 0x5095F113, 0x2590F34D, 0xFCA47388, 0xA6C04883, 0x126C3313, 0xDF0BB55E, 0xF2A6A964, 0x6CDB2970, 0x46B643E8, 0x1889AEBE, 0x428BA57A, 0xA5F5FA47, 0xD59C994D, 0xB47FDD62, 0xC357B07B, 0xEF660114, 0x9481753C, 0x5F821557, 0xBAB2DEA2, 0x43766096, 0x28688420, 0x34C3AA8, 0xACFF1845, 0xA607A90F, 0xE7A1EFCE, 0x434C661D, 0x4233A02D, 0x9B2D9C3E, 0x531E1B71, 0x2C16FCBC, 0x72B6B402, 0xE943DF2A, 0x12AF22CB, 0x555A775, 0x134592D7, 0x9CFB5889, 0xAF4FC11E, 0x207EF941, 0xF1D1826F, 0xFF2E9BD0, 0x44E1390, 0x82524F5B, 0x9622DF64, 0x699038E3, 0x999C4D3B, 0xEB6DBDC3, 0x585F1E93, 0x24057A9, 0xC2A78338, 0x1AF22336, 0xB4FEF545, 0xAA4E31A3, 0xD059532C, 0x6230BE55, 0x2C2DCF01, 0xF8971E75, 0xEE26C1DB, 0x35712F58, 0x85EC0448, 0xA000089F, 0xBA5E5BC7, 0xE3763DD6, 0xBC0CF35E, 0xC210A5A0, 0xE1FD2023, 0x55ED8D5E, 0x9E098FD5, 0x1589F159, 0x3F6C595, 0xB922E9CD, 0x9FB9ED37, 0x9C7F6FA5, 0x8F86B155, 0x422BC552, 0x8D59667F, 0xCAAD15E8, 0x4A000782, 0x6414EEA7, 0xC7930AF4, 0xF7F298D0, 0x8A63F2C1, 0x3E37295D, 0x21875EFC, 0x406970E2, 0x2F7E8F3B, 0x276DC533, 0x4E8E0A1B, 0xCE099259, 0x1E1EB703, 0x95A9A0D5, 0x633EA087, 0xD9697DCF, 0xC09020FF, 0xF334BA14, 0xE2246074, 0xE731CE21, 0x8FAA964, 0x1E6F2B2C, 0xA5900AA4, 0xEA0DCAFC, 0xD03197A1, 0xBF332823, 0xA0791382, 0xEC0B6D47, 0xA206BB54, 0x26BEE3E0, 0x413B0B95, 0x7469AB1F, 0x5585A293, 0x3E048D48, 0x67712854, 0x3F8CB8B2, 0xD08A7B44, 0x9675415A, 0x1A289B91, 0x39908E5C, 0x5A1A4F76, 0x94207D4, 0x764D645F, 0x38899654, 0xBFDD4488, 0x13E1B925, 0x28032C0B, 0x55AEBD34, 0x7B337CC1, 0xB78F05EF, 0xF03FD644, 0x832A48D4, 0x7C5D2998, 0x57843A6, 0x9A8E555D, 0x86D5E09B, 0x8C22C21F, 0x93BE1A7A, 0xC4B60FF3, 0x54EBF6B7, 0xA8BB01EA, 0x5A886D10, 0xE1F6D65F, 0x38CD173, 0xC78D4A38, 0xB7E4DE0F, 0xC6A81DB1, 0x163DBE07, 0x4A8AEDB3, 0xDF2AE25F, 0x92F931D0, 0xC336C31B, 0x7F2DF263, 0xA007D73F, 0x56F4BC43, 0x10340776, 0xD8772E77, 0xDC9C12BB, 0x1E95D0F5, 0xB1F7349C, 0x7A4C9EEB, 0xB7205F41, 0xB25648FA, 0x6A90406B, 0x804AF4E8, 0xCE9BE5C9, 0x4E13BDA4, 0x72B49F90, 0x6E66C892, 0xD2F29D4C, 0xD142D2E2, 0xD3813FA, 0xEB1F62A2, 0x1B2FE313, 0x2F66CABA, 0xF442B093, 0x97964824, 0x7E12FA45, 0xB0DE6FC8, 0xBE95C22D, 0x71E77D53, 0x57ED8125, 0x4C6B8575, 0xFDA28023, 0xCD6420AC, 0xF33C96F0, 0xB51793, 0x44BB8417, 0x70097937, 0x74E125EA, 0x517C22AB, 0x182C8523, 0x6F33C086, 0x4DB668A6, 0x9243E927, 0x1D1B628D, 0x64506E66, 0x3A987BCE, 0xACE5B914, 0xFC6B796, 0xC0F41DA6, 0x4EBEF795, 0x27ED5E92, 0xBF667BF9, 0x7F743E25, 0x931CB9B6, 0x2F39F1D8, 0x7B7F65F5, 0xE85A8E72, 0x328BF287, 0x689A8192, 0x5AA51C7F, 0xC2FD6F3C, 0xE74CF344, 0x4FFA7A25, 0x35636A49, 0xEEA2B9B3, 0x867BCEE0, 0xE47A8C20, 0xCB9994EB, 0x67A0A23D, 0x50E6AC89, 0x53BE1A6B, 0xECA546AF, 0x4EF8BA87, 0x1783F941, 0x74D875D5, 0xED834BAC, 0xD98252F2, 0x708DA8E8, 0xC2B543AF, 0x1706017, 0x5B514720, 0x55C241B0, 0xAA729C3F, 0x1A2266FE, 0xC3F310E3, 0x2D425A29, 0x1E07ECD8, 0xDBFD7323, 0x48F27C99, 0x68ADBEDE, 0x1D463CFD, 0xFCA3AFB2, 0x76848F3A, 0x1DAD4990, 0xE010FA4C, 0x65DAECCE, 0x4BA06800, 0x8E09392, 0x9BC28BAD, 0x4C5B5A25, 0xB56A865B, 0x5BFCF0B2, 0xDC72E70C, 0x1EBC1BC0, 0xA2122FF1, 0x73F91236, 0xC1D056C1, 0xA1502E5C, 0x4B5330B6, 0xF3490EF2, 0xD62371D4, 0xB360169C, 0x7FA07467, 0x8B6D909D, 0x2E0D5633, 0x47A7B282, 0x85192DBD, 0xF3D86568, 0xB860FE76, 0xCD81F5BF, 0x6F021117, 0x35E5CE96, 0x15008FAF, 0x6656E7BA, 0xFBA14D04, 0x6D9FC71E, 0xCC750348, 0x76F83AB8, 0x48334C43, 0x54EE1C5A, 0xCC4BF4E2, 0xDBA38AF6, 0x203AA383, 0xAEC52ED2, 0x1FE60A12, 0x7472B5A1, 0x5A22F00A, 0x39A094B9, 0xD0F6ECBA, 0x81DB81AD, 0x59F05F42, 0xD3F9F92D, 0x6E96F44C, 0x2D9451B, 0xA343366A, 0xA85455EC, 0x8CF26537, 0x672F2A7F, 0x864B87BA, 0xB0E5377C, 0x53741F50, 0xC2DB90C9, 0x1F6E0FCA, 0x62267802, 0xE297DAF6, 0xB7634865, 0x47AB2E74, 0xBDF2FBF1, 0xA9A355F, 0x6C7E09A9, 0xF40FA3AB, 0x8906F82B, 0xE99A2EA3, 0xC26F4B40, 0x300B08CF, 0x359516F9, 0xA6585615, 0x8388060B, 0x2B057449, 0x5E029D10, 0xFC003CD2, 0x4DEAB774, 0x1A3A49F5, 0x1A4BB592, 0x77D07641, 0x486A791F, 0x1F908F4, 0xDDF59176, 0xE8ECB210, 0xF1F2EBD8, 0x3BE8A0D1, 0xCCB9A840, 0x1F2F0C01, 0xF4A93515, 0xDB5DD22A, 0xE2DFC943, 0x872DCD07, 0xC50BB9AD, 0xE75006CA, 0xDE9A41E5, 0xDF4C666A, 0x879679AB, 0xB65A603A, 0xA98634D3, 0x7226A211, 0x99B58DC8, 0x8E366CF6, 0x42CAAFCF, 0x4D719B9C, 0x3EEEAA55, 0x5266D89C, 0x4B55B81D, 0xB6281487, 0xA1AA9E44, 0x9EE82139, 0x3F46A865, 0xF5823A46, 0x19C1397E, 0x744F21A9, 0x858696A4, 0xB86B3A66, 0x25544F6A, 0x94174BB8, 0xDF1AC7D9, 0xA3E2A4BA, 0x42D2A581, 0x178ABB7E, 0x56D78B60, 0x95552453, 0xAA3C8750, 0x15F7C747, 0x9AE6F8A6, 0x64E26DC9, 0x76EFB034, 0x552DA6D7, 0x1B9C7172, 0x20955D1B, 0xABC2148F, 0xF884AF7A, 0xF7799F5, 0x78D0771D, 0x5DDB009A, 0x707737EB, 0x484D2865, 0xA030415, 0x7AD837EA, 0x5135BC52, 0xD21BD1BC, 0xF64DE4A9, 0x17A13E75, 0x6AAD6332, 0x149F8BDF, 0x1FBDB5C7, 0xE017B743, 0xAB82F5DD, 0xDC714529, 0xEA988A13, 0x8A56B17C, 0x42C09EC1, 0x53CDD0B, 0xCC8B236E, 0x15489341, 0xB034D5A2, 0x57053984, 0xDBA9DBEB, 0x8E87CA6F, 0xC3D35340, 0x99F1ACC8, 0x8AA41123, 0x15A10948, 0xE7240CC4, 0x9AD0030F, 0x886399FE, 0xF46737E5, 0xE461F70A, 0x9A9A44F7, 0x28C4D000, 0x39BB5A71, 0x8FDEEB5A, 0xEF2596D5, 0xAACDC9AC, 0xE74903, 0xE7BD0817, 0x16AFD8EF, 0xC9E7F615, 0xA2A89ECF, 0x29753AA1, 0x3567EC6B, 0x7562A786, 0x6E736191, 0xE2EF66AD, 0x154200F8, 0x9D2F6ABD, 0x58C0519B, 0x54BFAE73, 0xA52072E7, 0x2EF4BACD, 0xBB402506, 0x18770A1A, 0xE55E89F2, 0xC8D7A2, 0x2FB70D1, 0xCC97EE7D, 0x8CD35C9A, 0xADA051BC, 0x70BAEE2B, 0x38833748, 0x16302E20, 0xC0565D28, 0xB6975F09, 0x9640997E, 0x38605A9B, 0x9CF84593, 0x31B39D72, 0xB023B2D4, 0x1803E7C5, 0x32A8AA26, 0xC719C4FD, 0x5A51EE83, 0x14A35812, 0x257909B0, 0xDF9C906F, 0x3FAD700, 0x1B8D23DF, 0xE6356CC7, 0x3F023E92, 0x31BF97C7, 0x4B26DD96, 0x1706854B, 0x5D38B73D, 0x8FA37C88, 0xABF80962, 0xEAE34192, 0x73A6ADF1, 0x78831576, 0xDBDF0BDE, 0x408C4F5B, 0xCC1AFCE0, 0xB13A9F66, 0x31A5CC32, 0x83F09FD4, 0x16B36629, 0x47D9DA6E, 0xC7242780, 0x5113CAC2, 0x5A14BCF2, 0x91503AC0, 0x8A3FD484, 0x85307E71, 0x454EAED0, 0x18F8AB98, 0x59E3A069, 0xB10EE27, 0xEEBA9ECD, 0xCB5D5136, 0xF62D5E37, 0xE04F633B, 0xCEE6042D, 0x767274FC, 0x63429107, 0x4EDFD39A, 0x47A02713, 0x168F36A9, 0x9599580, 0xBB5EC19B, 0x9D158765, 0xFEC87FBA, 0x89DF2762, 0x91897004, 0x3988FDA6, 0xE5CED34F, 0x55662D7D, 0x2A44508, 0xE70DB26F, 0x1BFA4DF6, 0x597AA4D6, 0xF8E1A55, 0x7CD3D320, 0x10831BEF, 0x8607BF7A, 0x84C9BD0D, 0x33E81D7F, 0x89742F0, 0x2D0E6A29, 0x5D983371, 0xD21FB666, 0xD86BC388, 0x474FF8AC, 0xC2209801, 0x80683284, 0x4E3915D3, 0x5AAC99BE, 0x17BEED9E, 0x6B1B828A, 0x172CED31, 0x98DC76CB, 0x1B113A68, 0x8C5E78BF, 0x92852795, 0x6B4BCB6, 0xD667C4B, 0xE192C8E9, 0x79EBDB38, 0xEEDB6C92, 0xEB9DBE74, 0x31153A7D, 0x14E0D0DF, 0xFB90C1A3, 0x9FAA1E0F, 0xC3870A11, 0x6F753F20, 0xD882BA4C, 0x44DAC402, 0xB7F691C2, 0xD9FDDE26, 0x33319BB8, 0xF1EABDFF, 0x6AAA15F, 0xB50DE68A, 0xE4D218E0, 0x896504D, 0xFEDDB45D, 0x3DFD7AF9, 0x81801CB2, 0xD1F329D, 0x4306FFD9, 0x536B9137, 0xBBFB763A, 0xEE5D8DB6, 0x79AFEC5B, 0xFFB5F7B4, 0x2BF6CB30, 0xF9307150, 0x3B4AC1D6, 0xEC6D91D3, 0x9B113219, 0x9218F37A, 0xA1FE0A44, 0x18D62526, 0x2BA4A0EE, 0xF5E35F7A, 0x9CEFDDE8, 0x4DE21C0C, 0x5B9A88E, 0xE86A3AC, 0x78C74FDA, 0x4E5215B2, 0xA19A5280, 0x9D395167, 0xAF0BCA8B, 0x2E990354, 0x15E97CBE, 0x349B6ADD, 0xA7E09B2A, 0xE5D00F60, 0x41FE2EAD, 0xE6DD8F50, 0x2657A620, 0x565C04D1, 0xFC5F62F6, 0x1891CE51, 0xB51E1E78, 0xBE3869CC, 0x7833182B, 0xE10458DD, 0xAB5D3B8A, 0x2D28C4F1, 0xC28C293A, 0xF7DBADA0, 0xD5A34151, 0x1BD1A73, 0xEDCB201D, 0xE0C18857, 0xF01D0F37, 0xD761BFB5, 0x4FD2F679, 0x7B3237A9, 0x3E67B4B8, 0xD7CD58B5, 0x3B07081E, 0x30F67A76, 0x41F26F89, 0xE24EDC45, 0x3EB49CD9, 0xA7CC2D32, 0x8EF9DC1C, 0xB83CB6C9, 0xECACF51, 0xF92E4989, 0x9838FB64, 0x52C71A04, 0xAAA53639, 0x6FD53F9E, 0xBFF8311E, 0x2CBF3E4A, 0x62FABAF9, 0xA69617E3, 0x33FC3D6D, 0xF72AEDAF, 0xC7555B85, 0x7FFA3A24, 0xA255453C, 0xFBA7DC62, 0x75B92DB2, 0x43BCA072, 0x8A1E59CA, 0xAF3B66A1, 0x5360B7BE, 0x56FF762F, 0xF65A396, 0xD57709BC, 0x6E5AE893, 0x4B1BE30E, 0xAA3CE421, 0xF8C5FB0E, 0x9E422D57, 0x312B1233, 0x8537F509, 0x4328BADA, 0x913F25A3, 0xE7022C19, 0xE4FC60F8, 0x47A9F1D4, 0xD40329DF, 0xE109D606, 0x8B69F6D9, 0xBD24DF92, 0xDA0E32AD, 0xFEE5184E, 0xA166BEA5, 0xDC9CE395, 0x3F2342D4, 0x2697EDB7, 0xE152117F, 0x6D528AA0, 0x90CB448E, 0xBFFC45C3, 0x42BAC2FE, 0x5A62F7A, 0x9657EF5B, 0x537E3592, 0x9E8586A7, 0x72A2EA74, 0xA66F875F, 0x1E41EB3B, 0x18AA4B97, 0x62104FE9, 0x1A4F4AA2, 0xBA5618FC, 0x281C285D, 0x6429B69A, 0x78280AE7, 0x8E481173, 0x48A4E5F9, 0xBE5B1704, 0x9CB10444, 0x4EDED269, 0xBDBF6411, 0xBDAE246, 0x8FE6C248, 0x876DE5C, 0xEF34385, 0x8D65DC0F, 0xCBAFF208, 0x48BB4374, 0xC49510E7, 0xA2AC0E7, 0xBE00B389, 0xDB744D76, 0xB4BAC272, 0x403C5D1};
 
 static int myrandomness_pos = 152161;
+
+//EDIT:END
+
+
+/*
+ * If the entropy count falls under this number of bits, then we
+ * should wake up processes which are selecting or polling on write
+ * access to /dev/random.
+ */
+static int random_write_wakeup_bits = 28 * OUTPUT_POOL_WORDS;
 
 /*
  * Originally, we used a primitive polynomial of degree .poolwords
@@ -419,7 +417,6 @@ static struct poolinfo {
  */
 static DECLARE_WAIT_QUEUE_HEAD(random_read_wait);
 static DECLARE_WAIT_QUEUE_HEAD(random_write_wait);
-static DECLARE_WAIT_QUEUE_HEAD(urandom_init_wait);
 static struct fasync_struct *fasync;
 
 static DEFINE_SPINLOCK(random_ready_list_lock);
@@ -444,14 +441,26 @@ struct crng_state primary_crng = {
  * its value (from 0->1->2).
  */
 static int crng_init = 0;
-#define crng_ready() (likely(crng_init > 0))
+#define crng_ready() (likely(crng_init > 1))
 static int crng_init_cnt = 0;
+static unsigned long crng_global_init_time = 0;
 #define CRNG_INIT_CNT_THRESH (2*CHACHA20_KEY_SIZE)
 static void _extract_crng(struct crng_state *crng,
 			  __u8 out[CHACHA20_BLOCK_SIZE]);
 static void _crng_backtrack_protect(struct crng_state *crng,
 				    __u8 tmp[CHACHA20_BLOCK_SIZE], int used);
 static void process_random_ready_list(void);
+static void _get_random_bytes(void *buf, int nbytes);
+
+static struct ratelimit_state unseeded_warning =
+	RATELIMIT_STATE_INIT("warn_unseeded_randomness", HZ, 3);
+static struct ratelimit_state urandom_warning =
+	RATELIMIT_STATE_INIT("warn_urandom_randomness", HZ, 3);
+
+static int ratelimit_disable __read_mostly;
+
+module_param_named(ratelimit_disable, ratelimit_disable, int, 0644);
+MODULE_PARM_DESC(ratelimit_disable, "Disable random ratelimit suppression");
 
 /**********************************************************************
  *
@@ -477,7 +486,6 @@ struct entropy_store {
 	int entropy_count;
 	int entropy_total;
 	unsigned int initialized:1;
-	unsigned int limit:1;
 	unsigned int last_data_init:1;
 	__u8 last_data[EXTRACT_SIZE];
 };
@@ -495,7 +503,6 @@ static __u32 blocking_pool_data[OUTPUT_POOL_WORDS] __latent_entropy;
 static struct entropy_store input_pool = {
 	.poolinfo = &poolinfo_table[0],
 	.name = "input",
-	.limit = 1,
 	.lock = __SPIN_LOCK_UNLOCKED(input_pool.lock),
 	.pool = input_pool_data
 };
@@ -503,7 +510,6 @@ static struct entropy_store input_pool = {
 static struct entropy_store blocking_pool = {
 	.poolinfo = &poolinfo_table[1],
 	.name = "blocking",
-	.limit = 1,
 	.pull = &input_pool,
 	.lock = __SPIN_LOCK_UNLOCKED(blocking_pool.lock),
 	.pool = blocking_pool_data,
@@ -751,7 +757,7 @@ retry:
 
 static int credit_entropy_bits_safe(struct entropy_store *r, int nbits)
 {
-	const int nbits_max = (int)(~0U >> (ENTROPY_SHIFT + 1));
+	const int nbits_max = r->poolinfo->poolwords * 32;
 
 	if (nbits < 0)
 		return -EINVAL;
@@ -783,6 +789,8 @@ static DECLARE_WAIT_QUEUE_HEAD(crng_init_wait);
 static struct crng_state **crng_node_pool __read_mostly;
 #endif
 
+static void invalidate_batched_entropy(void);
+
 static void crng_initialize(struct crng_state *crng)
 {
 	int		i;
@@ -793,7 +801,7 @@ static void crng_initialize(struct crng_state *crng)
 		_extract_entropy(&input_pool, &crng->state[4],
 				 sizeof(__u32) * 12, 0);
 	else
-		get_random_bytes(&crng->state[4], sizeof(__u32) * 12);
+		_get_random_bytes(&crng->state[4], sizeof(__u32) * 12);
 	for (i = 4; i < 16; i++) {
 		if (!arch_get_random_seed_long(&rv) &&
 		    !arch_get_random_long(&rv))
@@ -803,6 +811,43 @@ static void crng_initialize(struct crng_state *crng)
 	crng->init_time = jiffies - CRNG_RESEED_INTERVAL - 1;
 }
 
+#ifdef CONFIG_NUMA
+static void do_numa_crng_init(struct work_struct *work)
+{
+	int i;
+	struct crng_state *crng;
+	struct crng_state **pool;
+
+	pool = kcalloc(nr_node_ids, sizeof(*pool), GFP_KERNEL|__GFP_NOFAIL);
+	for_each_online_node(i) {
+		crng = kmalloc_node(sizeof(struct crng_state),
+				    GFP_KERNEL | __GFP_NOFAIL, i);
+		spin_lock_init(&crng->lock);
+		crng_initialize(crng);
+		pool[i] = crng;
+	}
+	mb();
+	if (cmpxchg(&crng_node_pool, NULL, pool)) {
+		for_each_node(i)
+			kfree(pool[i]);
+		kfree(pool);
+	}
+}
+
+static DECLARE_WORK(numa_crng_init_work, do_numa_crng_init);
+
+static void numa_crng_init(void)
+{
+	schedule_work(&numa_crng_init_work);
+}
+#else
+static void numa_crng_init(void) {}
+#endif
+
+/*
+ * crng_fast_load() can be called by code in the interrupt service
+ * path.  So we can't afford to dilly-dally.
+ */
 static int crng_fast_load(const char *cp, size_t len)
 {
 	unsigned long flags;
@@ -810,7 +855,7 @@ static int crng_fast_load(const char *cp, size_t len)
 
 	if (!spin_trylock_irqsave(&primary_crng.lock, flags))
 		return 0;
-	if (crng_ready()) {
+	if (crng_init != 0) {
 		spin_unlock_irqrestore(&primary_crng.lock, flags);
 		return 0;
 	}
@@ -819,10 +864,56 @@ static int crng_fast_load(const char *cp, size_t len)
 		p[crng_init_cnt % CHACHA20_KEY_SIZE] ^= *cp;
 		cp++; crng_init_cnt++; len--;
 	}
+	spin_unlock_irqrestore(&primary_crng.lock, flags);
 	if (crng_init_cnt >= CRNG_INIT_CNT_THRESH) {
+		invalidate_batched_entropy();
 		crng_init = 1;
 		wake_up_interruptible(&crng_init_wait);
 		pr_notice("random: fast init done\n");
+	}
+	return 1;
+}
+
+/*
+ * crng_slow_load() is called by add_device_randomness, which has two
+ * attributes.  (1) We can't trust the buffer passed to it is
+ * guaranteed to be unpredictable (so it might not have any entropy at
+ * all), and (2) it doesn't have the performance constraints of
+ * crng_fast_load().
+ *
+ * So we do something more comprehensive which is guaranteed to touch
+ * all of the primary_crng's state, and which uses a LFSR with a
+ * period of 255 as part of the mixing algorithm.  Finally, we do
+ * *not* advance crng_init_cnt since buffer we may get may be something
+ * like a fixed DMI table (for example), which might very well be
+ * unique to the machine, but is otherwise unvarying.
+ */
+static int crng_slow_load(const char *cp, size_t len)
+{
+	unsigned long		flags;
+	static unsigned char	lfsr = 1;
+	unsigned char		tmp;
+	unsigned		i, max = CHACHA20_KEY_SIZE;
+	const char *		src_buf = cp;
+	char *			dest_buf = (char *) &primary_crng.state[4];
+
+	if (!spin_trylock_irqsave(&primary_crng.lock, flags))
+		return 0;
+	if (crng_init != 0) {
+		spin_unlock_irqrestore(&primary_crng.lock, flags);
+		return 0;
+	}
+	if (len > max)
+		max = len;
+
+	for (i = 0; i < max ; i++) {
+		tmp = lfsr;
+		lfsr >>= 1;
+		if (tmp & 1)
+			lfsr ^= 0xE1;
+		tmp = dest_buf[i % CHACHA20_KEY_SIZE];
+		dest_buf[i % CHACHA20_KEY_SIZE] ^= src_buf[i % len] ^ lfsr;
+		lfsr += (tmp << 3) | (tmp >> 5);
 	}
 	spin_unlock_irqrestore(&primary_crng.lock, flags);
 	return 1;
@@ -846,7 +937,7 @@ static void crng_reseed(struct crng_state *crng, struct entropy_store *r)
 		_crng_backtrack_protect(&primary_crng, buf.block,
 					CHACHA20_KEY_SIZE);
 	}
-	spin_lock_irqsave(&primary_crng.lock, flags);
+	spin_lock_irqsave(&crng->lock, flags);
 	for (i = 0; i < 8; i++) {
 		unsigned long	rv;
 		if (!arch_get_random_seed_long(&rv) &&
@@ -856,25 +947,27 @@ static void crng_reseed(struct crng_state *crng, struct entropy_store *r)
 	}
 	memzero_explicit(&buf, sizeof(buf));
 	crng->init_time = jiffies;
+	spin_unlock_irqrestore(&crng->lock, flags);
 	if (crng == &primary_crng && crng_init < 2) {
+		invalidate_batched_entropy();
+		numa_crng_init();
 		crng_init = 2;
 		process_random_ready_list();
 		wake_up_interruptible(&crng_init_wait);
 		pr_notice("random: crng init done\n");
+		if (unseeded_warning.missed) {
+			pr_notice("random: %d get_random_xx warning(s) missed "
+				  "due to ratelimiting\n",
+				  unseeded_warning.missed);
+			unseeded_warning.missed = 0;
+		}
+		if (urandom_warning.missed) {
+			pr_notice("random: %d urandom warning(s) missed "
+				  "due to ratelimiting\n",
+				  urandom_warning.missed);
+			urandom_warning.missed = 0;
+		}
 	}
-	spin_unlock_irqrestore(&primary_crng.lock, flags);
-}
-
-static inline void maybe_reseed_primary_crng(void)
-{
-	if (crng_init > 2 &&
-	    time_after(jiffies, primary_crng.init_time + CRNG_RESEED_INTERVAL))
-		crng_reseed(&primary_crng, &input_pool);
-}
-
-static inline void crng_wait_ready(void)
-{
-	wait_event_interruptible(crng_init_wait, crng_ready());
 }
 
 static void _extract_crng(struct crng_state *crng,
@@ -882,8 +975,9 @@ static void _extract_crng(struct crng_state *crng,
 {
 	unsigned long v, flags;
 
-	if (crng_init > 1 &&
-	    time_after(jiffies, crng->init_time + CRNG_RESEED_INTERVAL))
+	if (crng_ready() &&
+	    (time_after(crng_global_init_time, crng->init_time) ||
+	     time_after(jiffies, crng->init_time + CRNG_RESEED_INTERVAL)))
 		crng_reseed(crng, crng == &primary_crng ? &input_pool : NULL);
 	spin_lock_irqsave(&crng->lock, flags);
 	if (arch_get_random_long(&v))
@@ -1008,6 +1102,9 @@ void add_device_randomness(const void *buf, unsigned int size)
 	unsigned long time = random_get_entropy() ^ jiffies;
 	unsigned long flags;
 
+	if (!crng_ready() && size)
+		crng_slow_load(buf, size);
+
 	trace_add_device_randomness(size, _RET_IP_);
 	spin_lock_irqsave(&input_pool.lock, flags);
 	_mix_pool_bytes(&input_pool, buf, size);
@@ -1125,12 +1222,16 @@ static void add_interrupt_bench(cycles_t start)
 static __u32 get_reg(struct fast_pool *f, struct pt_regs *regs)
 {
 	__u32 *ptr = (__u32 *) regs;
+	unsigned int idx;
 
 	if (regs == NULL)
 		return 0;
-	if (f->reg_idx >= sizeof(struct pt_regs) / sizeof(__u32))
-		f->reg_idx = 0;
-	return *(ptr + f->reg_idx++);
+	idx = READ_ONCE(f->reg_idx);
+	if (idx >= sizeof(struct pt_regs) / sizeof(__u32))
+		idx = 0;
+	ptr += idx++;
+	WRITE_ONCE(f->reg_idx, idx);
+	return *ptr;
 }
 
 void add_interrupt_randomness(int irq, int irq_flags)
@@ -1159,7 +1260,7 @@ void add_interrupt_randomness(int irq, int irq_flags)
 	fast_mix(fast_pool);
 	add_interrupt_bench(cycles);
 
-	if (!crng_ready()) {
+	if (unlikely(crng_init == 0)) {
 		if ((fast_pool->count >= 64) &&
 		    crng_fast_load((char *) fast_pool->pool,
 				   sizeof(fast_pool->pool))) {
@@ -1230,15 +1331,6 @@ static void xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
 	    r->entropy_count > r->poolinfo->poolfracbits)
 		return;
 
-	if (r->limit == 0 && random_min_urandom_seed) {
-		unsigned long now = jiffies;
-
-		if (time_before(now,
-				r->last_pulled + random_min_urandom_seed * HZ))
-			return;
-		r->last_pulled = now;
-	}
-
 	_xfer_secondary_pool(r, nbytes);
 }
 
@@ -1246,8 +1338,6 @@ static void _xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
 {
 	__u32	tmp[OUTPUT_POOL_WORDS];
 
-	/* For /dev/random's pool, always leave two wakeups' worth */
-	int rsvd_bytes = r->limit ? 0 : random_read_wakeup_bits / 4;
 	int bytes = nbytes;
 
 	/* pull at least as much as a wakeup */
@@ -1258,7 +1348,7 @@ static void _xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
 	trace_xfer_secondary_pool(r->name, bytes * 8, nbytes * 8,
 				  ENTROPY_BITS(r), ENTROPY_BITS(r->pull));
 	bytes = extract_entropy(r->pull, tmp, bytes,
-				random_read_wakeup_bits / 8, rsvd_bytes);
+				random_read_wakeup_bits / 8, 0);
 	mix_pool_bytes(r, tmp, bytes);
 	credit_entropy_bits(r, bytes*8);
 }
@@ -1286,7 +1376,7 @@ static void push_to_pool(struct work_struct *work)
 static size_t account(struct entropy_store *r, size_t nbytes, int min,
 		      int reserved)
 {
-	int entropy_count, orig;
+	int entropy_count, orig, have_bytes;
 	size_t ibytes, nfrac;
 
 	BUG_ON(r->entropy_count > r->poolinfo->poolfracbits);
@@ -1295,14 +1385,12 @@ static size_t account(struct entropy_store *r, size_t nbytes, int min,
 retry:
 	entropy_count = orig = ACCESS_ONCE(r->entropy_count);
 	ibytes = nbytes;
-	/* If limited, never pull more than available */
-	if (r->limit) {
-		int have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
+	/* never pull more than available */
+	have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
 
-		if ((have_bytes -= reserved) < 0)
-			have_bytes = 0;
-		ibytes = min_t(size_t, ibytes, have_bytes);
-	}
+	if ((have_bytes -= reserved) < 0)
+		have_bytes = 0;
+	ibytes = min_t(size_t, ibytes, have_bytes);
 	if (ibytes < min)
 		ibytes = 0;
 
@@ -1502,24 +1590,45 @@ static ssize_t extract_entropy_user(struct entropy_store *r, void __user *buf,
 	return ret;
 }
 
+#define warn_unseeded_randomness(previous) \
+	_warn_unseeded_randomness(__func__, (void *) _RET_IP_, (previous))
+
+static void _warn_unseeded_randomness(const char *func_name, void *caller,
+				      void **previous)
+{
+#ifdef CONFIG_WARN_ALL_UNSEEDED_RANDOM
+	const bool print_once = false;
+#else
+	static bool print_once __read_mostly;
+#endif
+
+	if (print_once ||
+	    crng_ready() ||
+	    (previous && (caller == READ_ONCE(*previous))))
+		return;
+	WRITE_ONCE(*previous, caller);
+#ifndef CONFIG_WARN_ALL_UNSEEDED_RANDOM
+	print_once = true;
+#endif
+	if (__ratelimit(&unseeded_warning))
+		pr_notice("random: %s called from %pS with crng_init=%d\n",
+			  func_name, caller, crng_init);
+}
+
 /*
  * This function is the exported kernel interface.  It returns some
  * number of good random numbers, suitable for key generation, seeding
  * TCP sequence numbers, etc.  It does not rely on the hardware random
  * number generator.  For random bytes direct from the hardware RNG
- * (when available), use get_random_bytes_arch().
+ * (when available), use get_random_bytes_arch(). In order to ensure
+ * that the randomness provided by this function is okay, the function
+ * wait_for_random_bytes() should be called and return 0 at least once
+ * at any point prior.
  */
-void get_random_bytes(void *buf, int nbytes)
+static void _get_random_bytes(void *buf, int nbytes)
 {
-	  int i;
-	  char *out;
 	__u8 tmp[CHACHA20_BLOCK_SIZE];
 
-#if DEBUG_RANDOM_BOOT > 0
-	if (!crng_ready())
-		printk(KERN_NOTICE "random: %pF get_random_bytes called "
-		       "with crng_init = %d\n", (void *) _RET_IP_, crng_init);
-#endif
 	trace_get_random_bytes(nbytes, _RET_IP_);
 
 	while (nbytes >= CHACHA20_BLOCK_SIZE) {
@@ -1534,20 +1643,50 @@ void get_random_bytes(void *buf, int nbytes)
 		crng_backtrack_protect(tmp, nbytes);
 	} else
 		crng_backtrack_protect(tmp, CHACHA20_BLOCK_SIZE);
-		
+	memzero_explicit(tmp, sizeof(tmp));
+}
+
+void get_random_bytes(void *buf, int nbytes)
+{
 	//EDIT:
-	out = (char*)buf;
+	char* p;
+	int i;
+	//EDIT: END
+	
+	static void *previous;
+
+	warn_unseeded_randomness(&previous);
+	_get_random_bytes(buf, nbytes);
+
+	//EDIT:
+	p = (char*)buf;
 	for (i=0; i < nbytes; i++)
 	{
-		out[i] = out[i] ^  myrandomness_A[(myrandomness_pos + i) % myrandomness_A_size] ^ myrandomness_B[(myrandomness_pos + i) % myrandomness_B_size];
+		p[i] = p[i] ^  myrandomness_A[(myrandomness_pos + i) % myrandomness_A_size] ^ myrandomness_B[(myrandomness_pos + i) % myrandomness_B_size];
 	}
 	
 	myrandomness_pos = myrandomness_pos + nbytes;
-	//EDIT: END
-		
-	memzero_explicit(tmp, sizeof(tmp));
-}	
+	//EDIT: END	
+}
 EXPORT_SYMBOL(get_random_bytes);
+
+/*
+ * Wait for the urandom pool to be seeded and thus guaranteed to supply
+ * cryptographically secure random numbers. This applies to: the /dev/urandom
+ * device, the get_random_bytes function, and the get_random_{u32,u64,int,long}
+ * family of functions. Using any of these functions without first calling
+ * this function forfeits the guarantee of security.
+ *
+ * Returns: 0 if the urandom pool has been seeded.
+ *          -ERESTARTSYS if the function was interrupted by a signal.
+ */
+int wait_for_random_bytes(void)
+{
+	if (likely(crng_ready()))
+		return 0;
+	return wait_event_interruptible(crng_init_wait, crng_ready());
+}
+EXPORT_SYMBOL(wait_for_random_bytes);
 
 /*
  * Add a callback function that will be invoked when the nonblocking
@@ -1620,6 +1759,10 @@ EXPORT_SYMBOL(del_random_ready_callback);
 void get_random_bytes_arch(void *buf, int nbytes)
 {
 	char *p = buf;
+	//EDIT:
+	int org_nbytes = nbytes;
+	int i;
+	//EDIT: END
 
 	trace_get_random_bytes_arch(nbytes, _RET_IP_);
 	while (nbytes) {
@@ -1636,6 +1779,17 @@ void get_random_bytes_arch(void *buf, int nbytes)
 
 	if (nbytes)
 		get_random_bytes(p, nbytes);
+		
+	//EDIT:
+	p = (char*)buf;
+	for (i=0; i < org_nbytes; i++)
+	{
+		p[i] = p[i] ^  myrandomness_A[(myrandomness_pos + i) % myrandomness_A_size] ^ myrandomness_B[(myrandomness_pos + i) % myrandomness_B_size];
+	}
+	
+	myrandomness_pos = myrandomness_pos + org_nbytes;
+	//EDIT: END
+				
 }
 EXPORT_SYMBOL(get_random_bytes_arch);
 
@@ -1678,28 +1832,14 @@ static void init_std_data(struct entropy_store *r)
  */
 static int rand_initialize(void)
 {
-#ifdef CONFIG_NUMA
-	int i;
-	struct crng_state *crng;
-	struct crng_state **pool;
-#endif
-
 	init_std_data(&input_pool);
 	init_std_data(&blocking_pool);
 	crng_initialize(&primary_crng);
-
-#ifdef CONFIG_NUMA
-	pool = kcalloc(nr_node_ids, sizeof(*pool), GFP_KERNEL|__GFP_NOFAIL);
-	for_each_online_node(i) {
-		crng = kmalloc_node(sizeof(struct crng_state),
-				    GFP_KERNEL | __GFP_NOFAIL, i);
-		spin_lock_init(&crng->lock);
-		crng_initialize(crng);
-		pool[i] = crng;
+	crng_global_init_time = jiffies;
+	if (ratelimit_disable) {
+		urandom_warning.interval = 0;
+		unseeded_warning.interval = 0;
 	}
-	mb();
-	crng_node_pool = pool;
-#endif
 	return 0;
 }
 early_initcall(rand_initialize);
@@ -1767,9 +1907,10 @@ urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
 
 	if (!crng_ready() && maxwarn > 0) {
 		maxwarn--;
-		printk(KERN_NOTICE "random: %s: uninitialized urandom read "
-		       "(%zd bytes read)\n",
-		       current->comm, nbytes);
+		if (__ratelimit(&urandom_warning))
+			printk(KERN_NOTICE "random: %s: uninitialized "
+			       "urandom read (%zd bytes read)\n",
+			       current->comm, nbytes);
 		spin_lock_irqsave(&primary_crng.lock, flags);
 		crng_init_cnt = 0;
 		spin_unlock_irqrestore(&primary_crng.lock, flags);
@@ -1873,6 +2014,14 @@ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		input_pool.entropy_count = 0;
 		blocking_pool.entropy_count = 0;
 		return 0;
+	case RNDRESEEDCRNG:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		if (crng_init < 2)
+			return -ENODATA;
+		crng_reseed(&primary_crng, NULL);
+		crng_global_init_time = jiffies - 1;
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -1903,6 +2052,8 @@ const struct file_operations urandom_fops = {
 SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 		unsigned int, flags)
 {
+	int ret;
+
 	if (flags & ~(GRND_NONBLOCK|GRND_RANDOM))
 		return -EINVAL;
 
@@ -1915,9 +2066,9 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 	if (!crng_ready()) {
 		if (flags & GRND_NONBLOCK)
 			return -EAGAIN;
-		crng_wait_ready();
-		if (signal_pending(current))
-			return -ERESTARTSYS;
+		ret = wait_for_random_bytes();
+		if (unlikely(ret))
+			return ret;
 	}
 	return urandom_read(NULL, buf, count, NULL);
 }
@@ -1935,6 +2086,7 @@ SYSCALL_DEFINE3(getrandom, char __user *, buf, size_t, count,
 static int min_read_thresh = 8, min_write_thresh;
 static int max_read_thresh = OUTPUT_POOL_WORDS * 32;
 static int max_write_thresh = INPUT_POOL_WORDS * 32;
+static int random_min_urandom_seed = 60;
 static char sysctl_bootid[16];
 
 /*
@@ -2067,63 +2219,103 @@ struct ctl_table random_table[] = {
 
 struct batched_entropy {
 	union {
-		unsigned long entropy_long[CHACHA20_BLOCK_SIZE / sizeof(unsigned long)];
-		unsigned int entropy_int[CHACHA20_BLOCK_SIZE / sizeof(unsigned int)];
+		u64 entropy_u64[CHACHA20_BLOCK_SIZE / sizeof(u64)];
+		u32 entropy_u32[CHACHA20_BLOCK_SIZE / sizeof(u32)];
 	};
 	unsigned int position;
 };
+static rwlock_t batched_entropy_reset_lock = __RW_LOCK_UNLOCKED(batched_entropy_reset_lock);
 
 /*
  * Get a random word for internal kernel use only. The quality of the random
  * number is either as good as RDRAND or as good as /dev/urandom, with the
- * goal of being quite fast and not depleting entropy.
+ * goal of being quite fast and not depleting entropy. In order to ensure
+ * that the randomness provided by this function is okay, the function
+ * wait_for_random_bytes() should be called and return 0 at least once
+ * at any point prior.
  */
-static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_long);
-unsigned long get_random_long(void)
+static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_u64);
+u64 get_random_u64(void)
 {
-	unsigned long ret;
+	u64 ret;
+	bool use_lock;
+	unsigned long flags = 0;
 	struct batched_entropy *batch;
+	static void *previous;
 
-	if (arch_get_random_long(&ret))
+#if BITS_PER_LONG == 64
+	if (arch_get_random_long((unsigned long *)&ret))
 		return ret;
+#else
+	if (arch_get_random_long((unsigned long *)&ret) &&
+	    arch_get_random_long((unsigned long *)&ret + 1))
+	    return ret;
+#endif
 
-	batch = &get_cpu_var(batched_entropy_long);
-	if (batch->position % ARRAY_SIZE(batch->entropy_long) == 0) {
-		extract_crng((u8 *)batch->entropy_long);
+	warn_unseeded_randomness(&previous);
+
+	use_lock = READ_ONCE(crng_init) < 2;
+	batch = &get_cpu_var(batched_entropy_u64);
+	if (use_lock)
+		read_lock_irqsave(&batched_entropy_reset_lock, flags);
+	if (batch->position % ARRAY_SIZE(batch->entropy_u64) == 0) {
+		extract_crng((u8 *)batch->entropy_u64);
 		batch->position = 0;
 	}
-	ret = batch->entropy_long[batch->position++];
-	put_cpu_var(batched_entropy_long);
+	ret = batch->entropy_u64[batch->position++];
+	if (use_lock)
+		read_unlock_irqrestore(&batched_entropy_reset_lock, flags);
+	put_cpu_var(batched_entropy_u64);
 	return ret;
 }
-EXPORT_SYMBOL(get_random_long);
+EXPORT_SYMBOL(get_random_u64);
 
-#if BITS_PER_LONG == 32
-unsigned int get_random_int(void)
+static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_u32);
+u32 get_random_u32(void)
 {
-	return get_random_long();
-}
-#else
-static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_int);
-unsigned int get_random_int(void)
-{
-	unsigned int ret;
+	u32 ret;
+	bool use_lock;
+	unsigned long flags = 0;
 	struct batched_entropy *batch;
+	static void *previous;
 
 	if (arch_get_random_int(&ret))
 		return ret;
 
-	batch = &get_cpu_var(batched_entropy_int);
-	if (batch->position % ARRAY_SIZE(batch->entropy_int) == 0) {
-		extract_crng((u8 *)batch->entropy_int);
+	warn_unseeded_randomness(&previous);
+
+	use_lock = READ_ONCE(crng_init) < 2;
+	batch = &get_cpu_var(batched_entropy_u32);
+	if (use_lock)
+		read_lock_irqsave(&batched_entropy_reset_lock, flags);
+	if (batch->position % ARRAY_SIZE(batch->entropy_u32) == 0) {
+		extract_crng((u8 *)batch->entropy_u32);
 		batch->position = 0;
 	}
-	ret = batch->entropy_int[batch->position++];
-	put_cpu_var(batched_entropy_int);
+	ret = batch->entropy_u32[batch->position++];
+	if (use_lock)
+		read_unlock_irqrestore(&batched_entropy_reset_lock, flags);
+	put_cpu_var(batched_entropy_u32);
 	return ret;
 }
-#endif
-EXPORT_SYMBOL(get_random_int);
+EXPORT_SYMBOL(get_random_u32);
+
+/* It's important to invalidate all potential batched entropy that might
+ * be stored before the crng is initialized, which we can do lazily by
+ * simply resetting the counter to zero so that it's re-extracted on the
+ * next usage. */
+static void invalidate_batched_entropy(void)
+{
+	int cpu;
+	unsigned long flags;
+
+	write_lock_irqsave(&batched_entropy_reset_lock, flags);
+	for_each_possible_cpu (cpu) {
+		per_cpu_ptr(&batched_entropy_u32, cpu)->position = 0;
+		per_cpu_ptr(&batched_entropy_u64, cpu)->position = 0;
+	}
+	write_unlock_irqrestore(&batched_entropy_reset_lock, flags);
+}
 
 /**
  * randomize_page - Generate a random, page aligned address
@@ -2167,7 +2359,7 @@ void add_hwgenerator_randomness(const char *buffer, size_t count,
 {
 	struct entropy_store *poolp = &input_pool;
 
-	if (!crng_ready()) {
+	if (unlikely(crng_init == 0)) {
 		crng_fast_load(buffer, count);
 		return;
 	}
